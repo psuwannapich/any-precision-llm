@@ -54,7 +54,7 @@ class AnyPrecisionForCausalLM(nn.Module):
         with init_empty_weights():
             self.model = AutoModelForCausalLM.from_config(
                 config=config,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 trust_remote_code=trust_remote_code,
                 # attn_implementation="flash_attention_2",
             )

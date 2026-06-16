@@ -21,7 +21,7 @@ __global__ void matmul_kbit_32(
 ) {
     static_assert(maxm >= 1 && bits >= 3 && bits <= 8);
     static_assert(!use_ksplit || maxm == 1);
-    constexpr bool use_half2_centroid = (bits == 3 || (bits == 4 && maxm > 1));
+    constexpr bool use_half2_centroid = (bits == 4 && maxm > 1);
     constexpr int multi_row = (maxm == 1 ? 1 : 4);
 
     constexpr int num_centroids = 1 << bits, warp_size = 32;

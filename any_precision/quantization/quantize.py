@@ -256,15 +256,16 @@ def seed_and_upscale(
 
     if cpu_count is None:
         cpu_count = os.cpu_count()
+    max_numba_threads = numba.get_num_threads()
     # Determine IO and threading settings based on the number of cores
     if cpu_count >= 8:
         pipelined_io = True
         io_workers = 2 if cpu_count >= 64 else 1
-        numba.set_num_threads(cpu_count - io_workers)
+        numba.set_num_threads(max(1, min(cpu_count - io_workers, max_numba_threads)))
     else:
         pipelined_io = False
         io_workers = 0  # No separate IO workers needed for non-pipelined IO
-        numba.set_num_threads(cpu_count)
+        numba.set_num_threads(max(1, min(cpu_count, max_numba_threads)))
 
     logging.info(f"Using {cpu_count} cores for parallelization")
 

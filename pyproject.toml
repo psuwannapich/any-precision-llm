@@ -1,0 +1,38 @@
+[project]
+name = "any-precision-llm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=0.34.0",
+    "attributedict~=0.3.0",
+    "datasets~=2.17.0",
+    "flash1dkmeans>=0.2.3",
+    "lm-eval==0.4.3",
+    "numba~=0.60.0",
+    "numpy~=1.26.4",
+    "pandas~=2.2.0",
+    "pyyaml~=6.0.1",
+    "safetensors~=0.4.2",
+    "setuptools~=68.2.0",
+    "threadpoolctl~=3.2.0",
+    "torch~=2.2.2",
+    "tqdm~=4.66.2",
+    "transformers>=4.51.0,<5.0.0",
+    "any-precision-ext",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.6.0"]
+
+[project.entry-points."vllm.general_plugins"]
+any_precision_vllm = "any_precision.vllm_integration.plugin:register"
+
+[tool.uv.sources]
+any-precision-ext = { path = "any_precision/modules/kernels" }
+
+[tool.uv.extra-build-dependencies]
+any-precision-ext = ["torch", "wheel"]
