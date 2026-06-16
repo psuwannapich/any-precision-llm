@@ -14,6 +14,7 @@
 // include path so these resolve. matmul.cuh #includes dequant.cuh, which also
 // provides `num_rows` (=4) and DIV_ROUND_UP.
 #include "matmul.cuh"
+#include <atomic>
 
 #include <cstdio>
 #include <cstdlib>
@@ -85,7 +86,13 @@ void launchMatmulKbit(const __half* in, const uint32_t* qw, const __half* lut,
 {
     ensureTables();
     const int multi_row = (M == 1 ? 1 : 4);
-    const int use_ksplit = (!isOrin && M == 1 && K > 4096 && wBits >= 7) ? 1 : 0;
+    // ksplit is a decode-latency optimization (M==1, K>4096, wBits>=7). It is
+    // disabled by default pending validation on sm_120 (Blackwell), where it was
+    // implicated in an intermittent misaligned-address fault; the non-ksplit
+    // kernel is numerically identical. Set ANYPREC_KSPLIT=1 to re-enable.
+    static const bool ksplitEnabled = (std::getenv("ANYPREC_KSPLIT") != nullptr);
+    const int use_ksplit =
+        (ksplitEnabled && !isOrin && M == 1 && K > 4096 && wBits >= 7) ? 1 : 0;
     const int num_ksplit = use_ksplit ? DIV_ROUND_UP(K, 4096) : 1;
 
     dim3 grid(N / (num_rows * multi_row));
@@ -154,9 +161,13 @@ void launchAddBias(__half* out, const __half* bias, int M, int N,
 
 // ---- process-global active precision ---------------------------------------
 
-static thread_local int g_currentPrecision = 0;
+// Process-global (NOT thread_local): TensorRT-LLM calls enqueue() on a worker
+// thread, while ap_set_precision() is called from the Python/main thread. A
+// thread_local here would leave the worker at its default (0) and silently run
+// every request at the baked default precision.
+static std::atomic<int> g_currentPrecision{0};
 
-void setCurrentPrecision(int bits) { g_currentPrecision = bits; }
-int getCurrentPrecision() { return g_currentPrecision; }
+void setCurrentPrecision(int bits) { g_currentPrecision.store(bits, std::memory_order_release); }
+int getCurrentPrecision() { return g_currentPrecision.load(std::memory_order_acquire); }
 
 } // namespace anyprec

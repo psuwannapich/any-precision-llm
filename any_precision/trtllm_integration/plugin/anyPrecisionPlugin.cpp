@@ -5,6 +5,8 @@
 #include <cassert>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <atomic>
 
 using namespace nvinfer1;
 
@@ -174,6 +176,20 @@ int AnyPrecisionPlugin::enqueue(const PluginTensorDesc* inputDesc,
     const PluginTensorDesc* outputDesc, const void* const* inputs,
     void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
+    // Lazily upload weights if TensorRT did not call initialize() on this
+    // instance before enqueue (observed with the TRT-LLM runtime on TRT 10.x).
+    // mQweightDev is nullptr until initialize()/this guard runs.
+    if (mQweightDev == nullptr)
+    {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "[AnyPrecisionPlugin] enqueue performing lazy "
+                                 "initialize() (TRT-LLM runtime did not call "
+                                 "initialize()); this is expected.\n");
+        if (initialize() != 0)
+            return -1;
+    }
+
     // M = product of all dims except the last (the hidden dim K).
     const Dims& inDims = inputDesc[0].dims;
     int M = 1;
@@ -193,7 +209,22 @@ int AnyPrecisionPlugin::enqueue(const PluginTensorDesc* inputDesc,
     auto* out = static_cast<__half*>(outputs[0]);
     const __half* lut = mLutDev + lutOffsetElems(precision);
 
-    if (M >= 1 && M <= 8)
+    // DIAGNOSTIC: ANYPREC_NOOP=1 makes the plugin a no-op that only zeroes its
+    // output (reads no weights/LUT). Used to isolate whether a runtime fault is
+    // inside this plugin or elsewhere in the engine.
+    if (std::getenv("ANYPREC_NOOP") != nullptr)
+    {
+        cudaMemsetAsync(out, 0, (size_t) M * N * sizeof(__half), stream);
+        return 0;
+    }
+
+    // The custom kbit-matmul kernel is the fast path for small M (1..8). Setting
+    // ANYPREC_FORCE_DEQUANT=1 forces the dequant+cuBLAS GEMM path for all M,
+    // which is useful for bringing up a new arch (e.g. sm_120) where the custom
+    // kernel may need attention.
+    static const bool forceDequant =
+        (std::getenv("ANYPREC_FORCE_DEQUANT") != nullptr);
+    if (!forceDequant && M >= 1 && M <= 8)
     {
         launchMatmulKbit(in, reinterpret_cast<const uint32_t*>(mQweightDev), lut,
                          M, N, K, precision, mIsOrin, out, stream);
@@ -222,19 +253,19 @@ DataType AnyPrecisionPlugin::getOutputDataType(int index,
 int AnyPrecisionPlugin::initialize() noexcept
 {
     const size_t qwBytes = mQweightHost.size() * sizeof(int32_t);
-    AP_CUDA_CHECK(cudaMalloc(&mQweightDev, qwBytes));
+    AP_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&mQweightDev), qwBytes));
     AP_CUDA_CHECK(cudaMemcpy(mQweightDev, mQweightHost.data(), qwBytes,
                              cudaMemcpyHostToDevice));
 
     const size_t lutBytes = mLutHost.size() * sizeof(__half);
-    AP_CUDA_CHECK(cudaMalloc(&mLutDev, lutBytes));
+    AP_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&mLutDev), lutBytes));
     AP_CUDA_CHECK(cudaMemcpy(mLutDev, mLutHost.data(), lutBytes,
                              cudaMemcpyHostToDevice));
 
     if (mHasBias)
     {
         const size_t biasBytes = mBiasHost.size() * sizeof(__half);
-        AP_CUDA_CHECK(cudaMalloc(&mBiasDev, biasBytes));
+        AP_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&mBiasDev), biasBytes));
         AP_CUDA_CHECK(cudaMemcpy(mBiasDev, mBiasHost.data(), biasBytes,
                                  cudaMemcpyHostToDevice));
     }
@@ -373,7 +404,12 @@ IPluginV2* AnyPrecisionPluginCreator::deserializePlugin(
 } // namespace anyprec
 
 // Auto-register the creator with the default ("") namespace when the .so loads.
-REGISTER_TENSORRT_PLUGIN(anyprec::AnyPrecisionPluginCreator);
+// REGISTER_TENSORRT_PLUGIN token-pastes its argument (pluginRegistrar##name), so
+// it needs an unqualified type name; alias the namespaced creator into global
+// scope for the macro. (Registration also happens explicitly via
+// ap_register_plugin() below, which the Python loader always calls.)
+using AnyPrecisionPluginCreator = anyprec::AnyPrecisionPluginCreator;
+REGISTER_TENSORRT_PLUGIN(AnyPrecisionPluginCreator);
 
 // ---- C ABI for the Python runtime (ctypes) ---------------------------------
 extern "C" {

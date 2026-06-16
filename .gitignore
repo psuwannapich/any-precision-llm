@@ -167,3 +167,17 @@ cache/
 
 # Evaluate directories
 any_precision/evaluate/input_tokens_cache/
+
+# --- TensorRT-LLM integration: generated build artifacts (not source) ---
+/trt_engine/
+/trt_engine_*/
+/trt_local/
+/trt_oss/
+/model.cache
+/cache/
+/.venv-gpu/
+quantize_cpu.log
+quantize_gpu.log
+gpu_env_install.log
+smoke*.log
+sanitize.log

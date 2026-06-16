@@ -1,0 +1,30 @@
+# Dockerfile.trtllm — thin layer over NVIDIA's official TensorRT-LLM release
+# image for running the Any-Precision x TensorRT-LLM test on Blackwell (sm_120).
+#
+# The base image already ships CUDA, TensorRT, tensorrt_llm, torch and cmake/nvcc
+# all matched to each other — which is exactly what the pinned torch~=2.2.2 repo
+# env CANNOT provide on sm_120. We only add what the integration's host-side code
+# needs on top (a Qwen3-capable transformers) and bake nothing from the repo:
+# the repo is bind-mounted at run time (see run_trtllm_docker.sh) so the plugin
+# and engine are rebuilt against live source.
+#
+# Pick a base tag that supports sm_120/Blackwell (TRT-LLM >= ~0.17 / 1.0). Find
+# current tags at: https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release
+#   docker build -f docker/Dockerfile.trtllm \
+#     --build-arg BASE_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:<tag> \
+#     -t anyprec-trtllm:local .
+ARG BASE_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.0.0
+FROM ${BASE_IMAGE}
+
+# Qwen3 needs transformers >= 4.51; only upgrade if the base image is older.
+RUN python3 -c "import transformers,sys; from packaging.version import parse as v; \
+      sys.exit(0 if v(transformers.__version__) >= v('4.51') else 1)" \
+    || pip install --no-cache-dir "transformers>=4.51,<5"
+
+# cmake is normally present in the release image; install it only if missing.
+RUN command -v cmake >/dev/null 2>&1 \
+    || (apt-get update && apt-get install -y --no-install-recommends cmake \
+        && rm -rf /var/lib/apt/lists/*)
+
+WORKDIR /work
+CMD ["/bin/bash"]

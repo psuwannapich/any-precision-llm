@@ -39,7 +39,12 @@ from . import convert_checkpoint as cc
 
 # Map TRT-LLM attention/mlp submodule attribute names -> our ap dict suffixes.
 ATTN_MAP = {"qkv": "attn.qkv", "dense": "attn.o"}
-MLP_MAP = {"gate": "mlp.gate", "fc": "mlp.up", "proj": "mlp.down"}
+# TRT-LLM GatedMLP computes proj( SiLU(fc(x)) * gate(x) ) — the activation is on
+# `fc`, not `gate`. Qwen3 SwiGLU is down( SiLU(gate_proj(x)) * up_proj(x) ), so
+# the SiLU'd gate_proj must map to TRT-LLM's `fc`, and up_proj to `gate`.
+# (Mapping them the other way silently applies SiLU to up_proj — a nonlinear
+# per-layer error that compounds into divergence.)
+MLP_MAP = {"fc": "mlp.gate", "gate": "mlp.up", "proj": "mlp.down"}
 
 
 def _make_ap_linear(meta, in_features, out_features, default_precision):
@@ -133,23 +138,22 @@ def build(model_path, output_dir, default_precision=8, max_batch_size=8,
     converted = cc.convert(model_path)
     meta = converted["meta"]
 
-    # Build a TRT-LLM Qwen config from the AP metadata.
-    cfg = QWenConfig(
-        architecture="Qwen3ForCausalLM",
-        dtype=dtype,
-        num_hidden_layers=meta["num_hidden_layers"],
-        num_attention_heads=meta["num_attention_heads"],
-        num_key_value_heads=meta["num_key_value_heads"],
-        hidden_size=meta["hidden_size"],
-        intermediate_size=meta["intermediate_size"],
-        vocab_size=meta["vocab_size"],
-        head_size=meta["head_dim"],
-        max_position_embeddings=meta["max_position_embeddings"],
-        norm_epsilon=meta["rms_norm_eps"],
-        rotary_base=meta["rope_theta"],
-        qwen_type="qwen3",
-        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
-    )
+    # Debug: limit layers to localize wiring bugs (ANYPREC_NUM_LAYERS).
+    _nl = os.environ.get("ANYPREC_NUM_LAYERS")
+    if _nl:
+        meta["num_hidden_layers"] = int(_nl)
+        print(f"[build_engine] DEBUG limiting to {_nl} layers")
+
+    # Build the TRT-LLM Qwen config straight from the HF config.json so that
+    # ALL Qwen3-specific fields are set correctly (hidden_act=silu, attn_bias=
+    # False, position_embedding_type=rope_gpt_neox, qk_layernorm, tie_word_
+    # embeddings, ...). Hand-constructing QWenConfig silently defaulted these
+    # wrong (gelu / attn bias / learned_absolute → no RoPE), producing garbage.
+    cfg = QWenConfig.from_hugging_face(
+        model_path, dtype=dtype,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1))
+    # Honor the ANYPREC_NUM_LAYERS debug limit (and keep meta consistent).
+    cfg.num_hidden_layers = meta["num_hidden_layers"]
 
     model = QWenForCausalLM(cfg)
     model = _swap_linears(model, converted, default_precision)
@@ -160,12 +164,17 @@ def build(model_path, output_dir, default_precision=8, max_batch_size=8,
     plugin_cfg.gpt_attention_plugin = dtype
     plugin_cfg.paged_kv_cache = True
     plugin_cfg.remove_input_padding = True
+    # The gate/up/down projections are AnyPrecisionLinear plugins, not standard
+    # Linears, so the fuse_gate_mlp graph pass (which reads Linear.weight) cannot
+    # apply. Disable it; the AP plugin does its own fused dequant-matmul.
+    plugin_cfg.use_fused_mlp = False
 
     build_cfg = tensorrt_llm.BuildConfig(
         max_batch_size=max_batch_size,
         max_input_len=max_input_len,
         max_seq_len=max_seq_len,
         plugin_config=plugin_cfg,
+        gather_context_logits=bool(int(os.environ.get("ANYPREC_GATHER_LOGITS", "0"))),
     )
 
     os.makedirs(output_dir, exist_ok=True)
